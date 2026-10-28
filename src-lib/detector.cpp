@@ -310,6 +310,57 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 
 	char **paths = (char **)list_to_array(plist);
 
+	/* Optional extra training shapes: a line such as "train_576x1024 = portrait.txt" in the .data file adds a network
+	 * size with its own list of images.  The network then trains at [net] width x height on "train" and at every extra
+	 * size on its list, switching every 10 iterations the way random=1 does, each size picked in proportion to the
+	 * number of images in its list.  One set of weights then learns objects as tall or as wide as each input shape
+	 * shows them, without stretching any image out of its aspect ratio.
+	 */
+	struct TrainingShape
+	{
+		int w;
+		int h;
+		list * plist;
+		char ** paths;
+	};
+	std::vector<TrainingShape> shapes;
+	shapes.push_back({net.w, net.h, plist, paths});
+	for (node * n = options->front; n; n = n->next)
+	{
+		kvp * p = reinterpret_cast<kvp *>(n->val);
+		int w = 0;
+		int h = 0;
+		char extra = '\0';
+		if (std::sscanf(p->key, "train_%dx%d%c", &w, &h, &extra) != 2)
+		{
+			continue;
+		}
+		p->used = 1;
+		if (w <= 0 or h <= 0 or w % 32 or h % 32)
+		{
+			darknet_fatal_error(DARKNET_LOC, "%s: the size in \"%s\" must be a multiple of 32 in both dimensions", datacfg, p->key);
+		}
+		list * shape_plist = get_paths(p->val);
+		if (shape_plist->size == 0)
+		{
+			darknet_fatal_error(DARKNET_LOC, "no training images available for %s (verify %s)", p->key, p->val);
+		}
+		shapes.push_back({w, h, shape_plist, (char **)list_to_array(shape_plist)});
+	}
+	size_t shape_images = 0;
+	if (shapes.size() > 1)
+	{
+		if (l.random)
+		{
+			darknet_fatal_error(DARKNET_LOC, "random=1 cannot be combined with the per-size training lists in %s", datacfg);
+		}
+		for (const auto & shape : shapes)
+		{
+			shape_images += shape.plist->size;
+			*cfg_and_state.output << "Training size " << shape.w << " x " << shape.h << ": " << shape.plist->size << " images" << std::endl;
+		}
+	}
+
 	const int calc_map_for_each = fmax(100, train_images_num / (net.batch * net.subdivisions));  // calculate mAP for each epoch (used to be every 4 epochs)
 	*cfg_and_state.output << "mAP calculations will be every " << calc_map_for_each << " iterations" << std::endl;
 
@@ -510,6 +561,43 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 			}
 			net = nets[0];
 		} // random=1
+		else if (shapes.size() > 1 and count++ % 10 == 0)
+		{
+			// pick the next training size in proportion to the number of images in its list
+			size_t pick = static_cast<size_t>(rand_uniform(0.0f, static_cast<float>(shape_images)));
+			size_t idx = 0;
+			while (idx + 1 < shapes.size() and pick >= shapes[idx].plist->size)
+			{
+				pick -= shapes[idx].plist->size;
+				idx ++;
+			}
+			const auto & shape = shapes[idx];
+
+			if (shape.paths != args.paths)
+			{
+				args.w = shape.w;
+				args.h = shape.h;
+				args.paths = shape.paths;
+				args.m = shape.plist->size;
+
+				*cfg_and_state.output << "Switching to training size " << shape.w << " x " << shape.h << std::endl;
+
+				// discard what we had started loading, and re-start loading
+				load_thread.join();
+				train = buffer;
+				Darknet::free_data(train);
+				load_thread = std::thread(Darknet::run_image_loading_control_thread, args);
+
+				if (shape.w != net.w or shape.h != net.h)
+				{
+					for (int k = 0; k < ngpus; ++k)
+					{
+						resize_network(nets + k, shape.w, shape.h);
+					}
+					net = nets[0];
+				}
+			}
+		}
 
 		load_thread.join();
 		train = buffer;
@@ -625,11 +713,13 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 		// This is where we decide if we have to do the mAP% calculations.
 		if (calc_map and (iteration >= next_map_calc or iteration == net.max_batches))
 		{
-			if (l.random)
+			if (l.random or shapes.size() > 1)
 			{
 				*cfg_and_state.output << "Resizing to initial size: " << init_w << " x " << init_h << std::endl;
 				args.w = init_w;
 				args.h = init_h;
+				args.paths = paths;
+				args.m = plist->size;
 				if (net.dynamic_minibatch)
 				{
 					for (int k = 0; k < ngpus; ++k)
@@ -773,9 +863,12 @@ void train_detector_internal(const bool break_after_burn_in, std::string & multi
 	Darknet::stop_image_loading_threads();
 
 	free((void*)base);
-	free(paths);
-	free_list_contents(plist);
-	free_list(plist);
+	for (const auto & shape : shapes)
+	{
+		free(shape.paths);
+		free_list_contents(shape.plist);
+		free_list(shape.plist);
+	}
 
 	free_list_contents_kvp(options);
 	free_list(options);
